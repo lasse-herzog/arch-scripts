@@ -1,0 +1,365 @@
+#!/bin/bash
+
+# bashsupport disable=BP5001
+readonly BOOT='/dev/disk/by-partlabel/BOOT'
+readonly BTRFS='/dev/mapper/cryptroot'
+readonly CRYPTROOT='/dev/disk/by-partlabel/CRYPTROOT'
+
+#######################################
+# description
+# Arguments:
+#  None
+# Returns:
+#   <unknown> ...
+#######################################
+function backup_secure_boot_keys() {
+  mkdir /etc/efi-keys-backup/
+  cd /etc/efi-keys-backup/ || return
+
+  efi-readvar -v PK -o PK_backup.esl
+  efi-readvar -v KEK -o KEK_backup.esl
+  efi-readvar -v db -o db_backup.esl
+  efi-readvar -v dbx -o dbx_backup.esl
+}
+
+#######################################
+# This function creates a unified kernel image using mkinitcpio.
+# To read more about unified kernel images read:
+# https://wiki.archlinux.org/title/Unified_kernel_image.
+# Globals:
+#   BTRFS
+#   CRYPTROOT
+# Arguments:
+#  None
+#######################################
+function bundle_unified_kernel_image() {
+  local cryptroot_uuid
+  cryptroot_uuid="$(blkid -s UUID -o value ${CRYPTROOT})"
+
+  # Configuring the command line parameters:
+  # rd.luks.name: Maps the UUID of the encrypted root partition to the name of
+  #               the mapped device after the LUKS partition is open.
+  # root:         Path to the root file system. When using LUKS this should
+  #               point to the path of the opened partition. In this case:
+  #               /dev/mapper/cryptroot.
+  # rw:           Mounts the root device as read-write.
+  echo "rd.luks.name=${cryptroot_uuid}=cryptroot root=${BTRFS} rw" >> /mnt/etc/kernel/cmdline
+
+  cat > /mnt/etc/mkinitcpio.d/linux.preset <<- EOF
+  ALL_config="/etc/mkinitcpio.conf"
+  ALL_kver="/boot/vmlinuz-linux-hardened"
+  ALL_microcode="/boot/*-ucode.img"
+
+  PRESETS=('default' 'fallback')
+
+  default_image="/boot/initramfs-linux.img"
+  default_efi_image="/efi/EFI/Linux/archlinux-linux.efi"
+  default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
+
+  fallback_image="/boot/initramfs-linux-fallback.img"
+  fallback_efi_image=/"efi/EFI/Linux/archlinux-linux-fallback.efi"
+  fallback_options="-S autodetect"
+EOF
+
+  chroot /mnt mkinitcpio -P
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+#######################################
+function prepare_chroot() {
+  cd /mnt || exit
+
+  mount --rbind /proc proc/
+  mount --rbind /sys sys/
+  mount --rbind /dev dev/
+  mount --rbind /sys/firmware/efi/efivars sys/firmware/efi/efivars/
+
+  cp /etc/resolv.conf etc/resolv.conf
+}
+
+#######################################
+# description
+# Globals:
+#   btrfs
+# Arguments:
+#  None
+#######################################
+function create_btrfs_subvolumes() {
+  mount "${BTRFS}" /mnt
+
+  btrfs sub create /mnt/@ \
+    && btrfs sub create /mnt/@home \
+    && btrfs sub create /mnt/@abs \
+    && btrfs sub create /mnt/@tmp \
+    && btrfs sub create /mnt/@srv \
+    && btrfs sub create /mnt/@snapshots \
+    && btrfs sub create /mnt/@btrfs \
+    && btrfs sub create /mnt/@log \
+    && btrfs sub create /mnt/@cache
+  umount /mnt
+}
+
+#######################################
+# description
+# Globals:
+#   cryptroot
+#   cryptroot_uuid
+# Arguments:
+#  None
+#######################################
+function encrypt_partitions() {
+  local luks_password
+
+  echo -n "Insert password for the LUKS container (you're not going to see the password): "
+
+  until get_password luks_password; do :; done
+
+  echo -n "${luks_password}" | cryptsetup luksFormat "${CRYPTROOT}" -d -
+  echo -n "${luks_password}" | cryptsetup open "${CRYPTROOT}" cryptroot -d -
+}
+
+#######################################
+# description
+# Globals:
+#   boot
+#   btrfs
+# Arguments:
+#  None
+#######################################
+function format_partitions() {
+  mkfs.fat -F 32 -n EFI "${BOOT}"
+  mkfs.btrfs -L ARCH "${BTRFS}"
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+#######################################
+function generate_initramfs() {
+  cat > /mnt/etc/mkinitcpio.conf <<- EOF
+  HOOKS=(systemd autodetect modconf block keyboard sd-vconsole sd-encrypt fsck filesystems)
+EOF
+
+  chroot /mnt mkinitcpio -P
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+# Returns:
+#   1 ...
+#######################################
+function get_password() {
+  local result=$1
+  local password
+  local password2
+
+  read -rs password
+  if [[ -z ${password} ]]; then
+    echo "You need to enter a password, please try again."
+    return 1
+  fi
+  echo
+  read -rsp "Please enter the password again (you're not going to see the password):" password2
+  echo
+  if [[ ${password} != "${password2}" ]]; then
+    echo "Passwords don't match, please try again."
+    return 1
+  fi
+
+  eval "$result"="${password}"
+
+  return 0
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+# Returns:
+#   <unknown> ...
+#######################################
+function install_aur_helper() {
+  su - admin -c '
+    git clone https://aur.archlinux.org/paru.git
+    cd paru
+    makepkg -csi --noconfirm
+    cd ..
+    rm -drf paru
+  '
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+#######################################
+function install_aur_packages() {
+  chroot /mnt su - admin -c 'paru -S --noconfirm --skipreview'
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+#######################################
+function install_pacman_packages() {
+  pacman -Syy --noconfirm archlinux-keyring
+
+  pacman-key --init
+  pacman-key --populate archlinux
+
+  pacstrap /mnt base btrfs-progs base-devel efibootmgr git linux-firmware linux-hardened networkmanager sbctl
+}
+
+#######################################
+# description
+# Globals:
+#   boot
+#   btrfs
+# Arguments:
+#  None
+#######################################
+function mount_filesystem() {
+  mount -o noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@ "${BTRFS}" /mnt
+
+  mkdir -p /mnt/{boot,btrfs,efi,home,srv,var/{abs,cache,log,tmp},.snapshots}
+
+  mount -o nodev,nosuid,noexec "${BOOT}" /mnt/efi
+
+  mount -o noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@home "${BTRFS}" /mnt/home \
+    && mount -o nodev,nosuid,noexec,noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@abs "${BTRFS}" /mnt/var/abs \
+    && mount -o nodev,nosuid,noexec,noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@tmp "${BTRFS}" /mnt/var/tmp \
+    && mount -o noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@srv "${BTRFS}" /mnt/srv \
+    && mount -o nodev,nosuid,noexec,noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@log "${BTRFS}" /mnt/var/log \
+    && mount -o nodev,nosuid,noexec,noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@cache "${BTRFS}" /mnt/var/cache \
+    && mount -o noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvol=@snapshots "${BTRFS}" /mnt/.snapshots \
+    && mount -o noatime,compress-force=zstd,commit=120,space_cache=v2,ssd,discard=async,autodefrag,subvolid=5 "${BTRFS}" /mnt/btrfs
+}
+
+#######################################
+# description
+# Arguments:
+#   1
+#######################################
+function partition_disk() {
+  sgdisk -n 1:0:+256M -c 1:"BOOT" -t 1:ef00 "${1}"
+  sgdisk -n 2:0:0 -c 2:"CRYPTROOT" -t 2:8300 "${1}"
+
+  partprobe "${1}"
+}
+
+#######################################
+# description
+# Arguments:
+#  None
+#######################################
+function sign_secure_boot_binaries() {
+  chroot /mnt sbctl sign -s /efi/EFI/Linux/archlinux-linux.efi
+}
+
+#######################################
+# description
+# Globals:
+#   PS3
+#   entry
+# Arguments:
+#  None
+#######################################
+function main() {
+  local disk
+  local response
+
+  PS3="Please select the disk where Arch Linux is going to be installed: "
+
+  select entry in $(lsblk -dpnoNAME | grep -P "/dev/sd|nvme|vd"); do
+    disk=${entry}
+    echo "Installing Arch Linux on ${disk}."
+    break
+  done
+
+  # Deleting old partition scheme.
+  read -r -p "This will delete the current partition table on ${disk}. Do you agree [y/N]? " response
+
+  response=${response,,}
+
+  if [[ ${response} =~ ^(yes|y)$ ]]; then
+    wipefs -af "${disk}"
+    sgdisk -Zo "${disk}"
+  else
+    exit
+  fi
+
+  partition_disk "${disk}"
+
+  encrypt_partitions
+
+  format_partitions
+
+  create_btrfs_subvolumes
+
+  mount_filesystem
+
+  mkdir -p /mnt/var/lib/{docker,machines,mysql,postgres} \
+    && chattr +C /mnt/var/lib/{docker,machines,mysql,postgres}
+
+  install_pacman_packages
+
+  genfstab -U /mnt >> /mnt/etc/fstab
+
+  prepare_chroot
+
+  ln -sf /mnt/usr/share/zoneinfo/"$(curl -s http://ip-api.com/line?fields=timezone)" /mnt/etc/localtime
+  chroot /mnt hwclock --systohc
+
+  echo "en_US.UTF-8 UTF-8" > /mnt/etc/locale.gen
+  chroot /mnt locale-gen
+
+  echo "LANG=en_US.UTF-8" > /mnt/etc/locale.conf
+  echo "KEYMAP=de-latin1" > /mnt/etc/vconsole.conf
+
+  echo "Workstation" > /mnt/etc/hostname
+
+  generate_initramfs
+
+  chroot /mnt mkinitcpio -P
+
+  chroot /mnt passwd
+
+  chroot /mnt useradd -m -G wheel admin
+  chroot /mnt passwd admin
+  # TODO check if passwordless sudo is needed
+  echo "admin ALL=(ALL) NOPASSWD:ALL" >> /mnt/etc/sudoers
+
+  sed -i 's/^#RUSTFLAGS.*/RUSTFLAGS="-C opt-level=2 -C target-cpu=native"/' /mnt/etc/makepkg.conf \
+    && sed -i 's/^#BUILDDIR.*/BUILDDIR=\/tmp\/makepkg/' /mnt/etc/makepkg.conf
+
+  local backup_secure_boot_keys
+  local generate_secure_boot_keys
+  local install_aur_helper
+
+  export -f backup_secure_boot_keys generate_secure_boot_keys install_aur_helper
+
+  chroot /mnt /bin/bash -c install_aur_helper
+
+  install_aur_packages
+
+  chroot /mnt /bin/bash -c backup_secure_boot_keys
+
+  chroot /mnt sbctl create-keys
+  chroot /mnt sbctl enroll-keys -m
+
+  bundle_unified_kernel_image
+
+  sign_secure_boot_binaries
+
+  # Create UEFI boot entries for the unified kernel images
+  chroot /mnt efibootmgr --create --disk "${disk}" --part 1 --label 'Arch Linux' --loader /efi/EFI/Linux/archlinux-linux.efi --unicode
+}
+
+main "$@"

@@ -57,9 +57,11 @@ function bundle_unified_kernel_image() {
   default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
 
   fallback_image="/boot/initramfs-linux-hardened-fallback.img"
-  fallback_efi_image=/"efi/EFI/Linux/archlinux-linux-fallback.efi"
+  fallback_efi_image="/efi/EFI/Linux/archlinux-linux-fallback.efi"
   fallback_options="-S autodetect"
 EOF
+
+  mkdir -p /mnt/efi/EFI/Linux
 
   chroot /mnt mkinitcpio -P
 }

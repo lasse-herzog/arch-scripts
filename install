@@ -361,7 +361,7 @@ function main() {
   sign_secure_boot_binaries
 
   # Create UEFI boot entries for the unified kernel images
-  chroot /mnt efibootmgr --create --disk "${disk}" --part 1 --label 'Arch Linux' --loader /efi/EFI/Linux/archlinux-linux.efi --unicode
+  chroot /mnt efibootmgr --create --disk "${disk}" --part 1 --label 'Arch Linux' --loader '\EFI\Linux\archlinux-linux.efi' --unicode
 }
 
 main "$@"

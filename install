@@ -43,7 +43,7 @@ function bundle_unified_kernel_image() {
   #               point to the path of the opened partition. In this case:
   #               /dev/mapper/cryptroot.
   # rw:           Mounts the root device as read-write.
-  echo "rd.luks.name=${cryptroot_uuid}=cryptroot root=${BTRFS} rw" >> /mnt/etc/kernel/cmdline
+  echo "rd.luks.name=${cryptroot_uuid}=cryptroot root=${BTRFS} rootflags=subvol=@ rw" >> /mnt/etc/kernel/cmdline
 
   cat > /mnt/etc/mkinitcpio.d/linux-hardened.preset <<- EOF
   ALL_config="/etc/mkinitcpio.conf"
@@ -312,7 +312,7 @@ function main() {
 
   install_pacman_packages
 
-  genfstab -U /mnt >> /mnt/etc/fstab
+  genfstab -U /mnt > /mnt/etc/fstab
 
   prepare_chroot
 
@@ -329,8 +329,6 @@ function main() {
 
   generate_initramfs
 
-  chroot /mnt mkinitcpio -P
-
   chroot /mnt passwd
 
   chroot /mnt useradd -m -G wheel admin
@@ -342,10 +340,9 @@ function main() {
     && sed -i 's/^#BUILDDIR.*/BUILDDIR=\/tmp\/makepkg/' /mnt/etc/makepkg.conf
 
   local backup_secure_boot_keys
-  local generate_secure_boot_keys
   local install_aur_helper
 
-  export -f backup_secure_boot_keys generate_secure_boot_keys install_aur_helper
+  export -f backup_secure_boot_keys install_aur_helper
 
   chroot /mnt /bin/bash -c install_aur_helper
 
